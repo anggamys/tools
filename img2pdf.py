@@ -9,4 +9,4 @@ def image_to_pdf(image_path, pdf_path):
     print(f"PDF saved to: {pdf_path}")
 
 # Example usage:
-image_to_pdf("./result/KTM_compressed.jpg", "./result/KTM_compressed.pdf")
+image_to_pdf("./result/*.jpg", "./result/*.pdf")

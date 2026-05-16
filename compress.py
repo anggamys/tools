@@ -1,6 +1,9 @@
 import os
 from PIL import Image
 
+def compress_pdf():
+    pass
+
 def compress_image_under_size(input_path, output_path, target_kb=500, min_quality=10, step=5):
     quality = 95  # Start from best quality
     img = Image.open(input_path)
@@ -15,9 +18,9 @@ def compress_image_under_size(input_path, output_path, target_kb=500, min_qualit
         quality -= step
     print(f"Could not compress below {target_kb}KB, lowest file: {os.path.getsize(output_path)//1024}KB at quality={quality+step}")
 
-# Example usage:
+# Example usage
 compress_image_under_size(
-    "./source/KTM.jpg",
-    "./result/KTM_compressed.jpg",
+    "./source/frame*.jpg",
+    "./result/*.jpg",
     target_kb=500
 )

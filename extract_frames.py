@@ -19,4 +19,4 @@ def extract_frames(video_path, output_folder):
     print(f"Done! {count} frames extracted.")
 
 # Example usage:
-extract_frames("./source/", "./result/frames/")
+extract_frames("./source/*.mp4", "./result/frames/")

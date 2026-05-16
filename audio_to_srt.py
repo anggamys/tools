@@ -51,7 +51,7 @@ import torch
 from tqdm import tqdm
 from transformers import pipeline, Pipeline
 
-import librosa
+# pyrefly: ignore [missing-import]
 import soundfile as sf
 
 # ---------------------------------------------------------------------------

@@ -206,47 +206,75 @@ def should_translate(text: str) -> bool:
 
 
 class SubtitleTranslator:
+    """
+    Translate subtitle text using HuggingFace Seq2Seq models.
+
+    Compatible with transformers v4 **and** v5 (which removed
+    ``pipeline('translation')``).  Uses ``AutoModelForSeq2SeqLM`` and
+    ``AutoTokenizer`` directly.
+    """
+
     def __init__(self, config: TranslationConfig) -> None:
         self.config = config
         self.device_id = resolve_device(config.device)
-        self.pipeline = self._build_pipeline()
+        self.model, self.tokenizer, self.forced_bos_token_id = self._load_model()
 
-    def _build_pipeline(self):
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
+    def _load_model(self):
         try:
-            from transformers import pipeline
+            import torch
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         except ModuleNotFoundError as error:
             raise RuntimeError(
-                "Missing dependency: transformers. Install dependencies from requirements.txt."
+                "Missing dependency: transformers / torch. "
+                "Install dependencies from requirements.txt."
             ) from error
 
         logger.info("Loading translation model: %s", self.config.model_name)
 
         try:
+            tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
+            model = AutoModelForSeq2SeqLM.from_pretrained(self.config.model_name)
+
+            # Resolve compute device
+            if self.device_id >= 0:
+                device = torch.device(f"cuda:{self.device_id}")
+            else:
+                device = torch.device("cpu")
+            model = model.to(device)
+            model.eval()
+
+            # NLLB models require forced_bos_token_id for target language
+            forced_bos_token_id = None
             if is_nllb_model(self.config.model_name):
                 src_code = to_nllb_language_code(self.config.source_lang)
                 tgt_code = to_nllb_language_code(self.config.target_lang)
-
                 logger.info("Using NLLB language codes: %s -> %s", src_code, tgt_code)
 
-                return pipeline(
-                    task="translation",
-                    model=self.config.model_name,
-                    src_lang=src_code,
-                    tgt_lang=tgt_code,
-                    device=self.device_id,
-                )
+                # Set source language for tokenizer
+                tokenizer.src_lang = src_code
+                forced_bos_token_id = tokenizer.convert_tokens_to_ids(tgt_code)
 
-            return pipeline(
-                task="translation",
-                model=self.config.model_name,
-                device=self.device_id,
-            )
+                if forced_bos_token_id is None or forced_bos_token_id == tokenizer.unk_token_id:
+                    raise ValueError(
+                        f"Target language code '{tgt_code}' is not recognized by the tokenizer. "
+                        "Check the NLLB language code."
+                    )
+
+            return model, tokenizer, forced_bos_token_id
+
         except Exception as error:
             raise RuntimeError(
                 f"Failed to load translation model: {self.config.model_name}. "
-                "Check the model name, internet connection, and available RAM/VRAM. "
-                "If you use transformers v5, install transformers<5.0.0 because this script uses pipeline('translation')."
+                "Check the model name, internet connection, and available RAM/VRAM."
             ) from error
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def translate_texts(self, texts: list[str]) -> list[str]:
         if not texts:
@@ -293,46 +321,42 @@ class SubtitleTranslator:
 
         return translations
 
+    # ------------------------------------------------------------------
+    # Batch inference
+    # ------------------------------------------------------------------
+
     def _translate_batch(self, texts: list[str]) -> list[str]:
+        import torch
+
+        device = next(self.model.parameters()).device
+
         try:
-            outputs = self.pipeline(
+            inputs = self.tokenizer(
                 texts,
-                batch_size=len(texts),
+                return_tensors="pt",
+                padding=True,
                 truncation=True,
                 max_length=self.config.max_length,
-                clean_up_tokenization_spaces=True,
+            ).to(device)
+
+            generate_kwargs: dict[str, Any] = {
+                "max_new_tokens": self.config.max_length,
+            }
+
+            if self.forced_bos_token_id is not None:
+                generate_kwargs["forced_bos_token_id"] = self.forced_bos_token_id
+
+            with torch.no_grad():
+                generated_tokens = self.model.generate(
+                    **inputs,
+                    **generate_kwargs,
+                )
+
+            translations = self.tokenizer.batch_decode(
+                generated_tokens, skip_special_tokens=True,
             )
-        except TypeError:
-            outputs = self.pipeline(
-                texts,
-                batch_size=len(texts),
-                truncation=True,
-                max_length=self.config.max_length,
-            )
+
+            return [t.strip() for t in translations]
+
         except Exception as error:
             raise RuntimeError("Translation inference failed.") from error
-
-        if isinstance(outputs, dict):
-            outputs = [outputs]
-
-        normalized_outputs: list[dict[str, Any]] = []
-
-        for item in outputs:
-            if isinstance(item, list) and item:
-                normalized_outputs.append(item[0])
-            elif isinstance(item, dict):
-                normalized_outputs.append(item)
-            else:
-                raise RuntimeError(f"Unexpected translation output format: {item!r}")
-
-        translations: list[str] = []
-
-        for output in normalized_outputs:
-            translated_text = output.get("translation_text") or output.get("generated_text")
-
-            if not isinstance(translated_text, str):
-                raise RuntimeError(f"Missing translated text in output: {output!r}")
-
-            translations.append(translated_text.strip())
-
-        return translations

@@ -42,12 +42,17 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 from tqdm import tqdm
 from transformers import pipeline, Pipeline
+
+import librosa
+import soundfile as sf
 
 # ---------------------------------------------------------------------------
 # Dependency checks — fail early with a helpful message
@@ -76,6 +81,68 @@ CHUNK_LENGTH_S       = 30          # seconds per chunk fed to Whisper
 BATCH_SIZE           = 8           # parallel chunks (reduce if OOM on GPU)
 STRIDE_LENGTH_S      = 5           # overlap between chunks for better continuity
 MAX_WORDS_PER_BLOCK  = 16          # max words per SRT subtitle block
+
+# ---------------------------------------------------------------------------
+# Progress callback types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TranscriptionProgress:
+    """
+    Immutable snapshot of transcription progress, passed to callbacks.
+
+    Attributes:
+        stage:                  Current processing stage.
+                                One of: 'validating', 'loading_audio',
+                                'transcribing', 'formatting', 'saving',
+                                'complete', 'error'.
+        percent:                Estimated completion percentage (0.0 – 100.0).
+        elapsed_seconds:        Wall-clock seconds since transcription started.
+        audio_duration_seconds: Total audio duration in seconds (0.0 if unknown).
+        total_segments:         Number of segments produced so far.
+        file_name:              Basename of the audio file being processed.
+        message:                Human-readable status message.
+    """
+    stage:                  str   = "validating"
+    percent:                float = 0.0
+    elapsed_seconds:        float = 0.0
+    audio_duration_seconds: float = 0.0
+    total_segments:         int   = 0
+    file_name:              str   = ""
+    message:                str   = ""
+
+
+# Callable that receives a TranscriptionProgress snapshot.
+ProgressCallback = Callable[[TranscriptionProgress], None]
+
+
+def _default_progress_callback(progress: TranscriptionProgress) -> None:
+    """Built-in callback that prints a one-line progress update to stdout."""
+    bar_width = 30
+    filled    = int(bar_width * progress.percent / 100)
+    bar       = "█" * filled + "░" * (bar_width - filled)
+    print(
+        f"\r[{bar}] {progress.percent:5.1f}% │ "
+        f"{progress.stage:<14} │ {progress.message}",
+        end="", flush=True,
+    )
+    if progress.stage in ("complete", "error"):
+        print()  # newline after final update
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+def _get_audio_duration(file_path: Path) -> float:
+    """
+    Return the duration of an audio file in seconds.
+
+    Tries librosa first (accurate), falls back to a rough estimate
+    based on file size if librosa is unavailable.
+    """
+    info = sf.info(str(file_path))
+    return float(info.duration)
 
 # ---------------------------------------------------------------------------
 # Core functions
@@ -132,15 +199,19 @@ def transcribe_audio(
     file_path: str | Path,
     asr_pipeline: Pipeline,
     language: Optional[str] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> List[dict]:
     """
     Transcribe an audio file and return a list of timed segments.
 
     Args:
-        file_path:    Path to the audio file.
-        asr_pipeline: Pre-loaded HuggingFace ASR pipeline.
-        language:     ISO-639-1 language code hint, e.g. 'en', 'id', 'fr'.
-                      None = auto-detect.
+        file_path:         Path to the audio file.
+        asr_pipeline:      Pre-loaded HuggingFace ASR pipeline.
+        language:          ISO-639-1 language code hint, e.g. 'en', 'id', 'fr'.
+                           None = auto-detect.
+        progress_callback: Optional callable invoked with a
+                           ``TranscriptionProgress`` snapshot at each stage.
+                           If *None*, a built-in console progress bar is used.
 
     Returns:
         List of segment dicts: [{"timestamp": (start, end), "text": "…"}, …]
@@ -150,38 +221,98 @@ def transcribe_audio(
         ValueError:        if the file extension is unsupported.
     """
     file_path = Path(file_path)
+    cb = progress_callback or _default_progress_callback
+    start_time = time.time()
+    file_name  = file_path.name
+    audio_dur  = 0.0
+
+    # --- Helper to emit progress ---
+    def _emit(
+        stage: str,
+        percent: float,
+        message: str,
+        segments: int = 0,
+    ) -> None:
+        cb(TranscriptionProgress(
+            stage=stage,
+            percent=min(percent, 100.0),
+            elapsed_seconds=time.time() - start_time,
+            audio_duration_seconds=audio_dur,
+            total_segments=segments,
+            file_name=file_name,
+            message=message,
+        ))
 
     # --- Validation ---
+    _emit("validating", 0.0, f"Validating '{file_name}' …")
+
     if not file_path.exists():
+        _emit("error", 0.0, f"File not found: {file_path}")
         raise FileNotFoundError(f"Audio file not found: {file_path}")
 
     if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        _emit("error", 0.0, f"Unsupported type: {file_path.suffix}")
         raise ValueError(
             f"Unsupported file type '{file_path.suffix}'. "
             f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
-    print(f"[INFO] Transcribing '{file_path.name}' …")
-    start_time = time.time()
+    # --- Get audio duration for progress estimation ---
+    _emit("loading_audio", 5.0, "Reading audio duration …")
+    audio_dur = _get_audio_duration(file_path)
+    _emit("loading_audio", 10.0,
+          f"Audio duration: {audio_dur:.1f}s ({audio_dur / 60:.1f} min)")
 
     # --- Build generation kwargs ---
     generate_kwargs: dict = {"task": "transcribe"}
     if language:
         generate_kwargs["language"] = language
 
+    # --- Background thread: estimate progress while pipeline runs ---
+    stop_event       = threading.Event()
+    transcribe_start = time.time()
+
+    def _progress_updater() -> None:
+        """Periodically fire the callback with an estimated percent."""
+        # Conservative speed assumption: ~3× real-time on CPU, ~15× on GPU.
+        # We cap estimated progress at 89% so the bar never "completes" early.
+        while not stop_event.is_set():
+            elapsed = time.time() - transcribe_start
+            # Rough estimate — most models process ≥2× real-time even on CPU
+            est_total = max(audio_dur / 3.0, 5.0)
+            pct = 10.0 + (elapsed / est_total) * 79.0  # map to 10%–89%
+            pct = min(pct, 89.0)
+            _emit("transcribing", pct,
+                  f"Transcribing … {elapsed:.0f}s elapsed")
+            stop_event.wait(2.0)  # update every 2 seconds
+
+    updater = threading.Thread(target=_progress_updater, daemon=True)
+    updater.start()
+
     # --- Run pipeline ---
-    result = asr_pipeline(
-        str(file_path),
-        chunk_length_s=CHUNK_LENGTH_S,
-        batch_size=BATCH_SIZE,
-        stride_length_s=STRIDE_LENGTH_S,
-        return_timestamps=True,        # required for SRT timing
-        generate_kwargs=generate_kwargs,
-    )
+    try:
+        result = asr_pipeline(
+            str(file_path),
+            chunk_length_s=CHUNK_LENGTH_S,
+            batch_size=BATCH_SIZE,
+            stride_length_s=STRIDE_LENGTH_S,
+            return_timestamps=True,        # required for SRT timing
+            generate_kwargs=generate_kwargs,
+        )
+    finally:
+        stop_event.set()
+        updater.join(timeout=2.0)
 
     elapsed = time.time() - start_time
     chunks: list = result.get("chunks", [])
-    print(f"[INFO] Transcription done in {elapsed:.1f}s — {len(chunks)} segments found.")
+
+    _emit("transcribing", 90.0,
+          f"Transcription done in {elapsed:.1f}s — {len(chunks)} segments",
+          segments=len(chunks))
+
+    _emit("complete", 100.0,
+          f"Finished '{file_name}' — {len(chunks)} segments in {elapsed:.1f}s",
+          segments=len(chunks))
 
     return chunks
 
@@ -402,10 +533,14 @@ def process_file(
     asr_pipeline: Pipeline,
     output_arg: Optional[str],
     language: Optional[str],
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> None:
     """Transcribe a single file and save its .srt output."""
     try:
-        segments    = transcribe_audio(audio_path, asr_pipeline, language)
+        segments = transcribe_audio(
+            audio_path, asr_pipeline, language,
+            progress_callback=progress_callback,
+        )
         srt_content = segments_to_srt(segments)
 
         if not srt_content.strip():

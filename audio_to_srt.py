@@ -71,10 +71,11 @@ _require("tqdm",         "pip install tqdm")
 
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".webm"}
 
-DEFAULT_MODEL   = "openai/whisper-base"
-CHUNK_LENGTH_S  = 30          # seconds per chunk fed to Whisper
-BATCH_SIZE      = 8           # parallel chunks (reduce if OOM on GPU)
-STRIDE_LENGTH_S = 5           # overlap between chunks for better continuity
+DEFAULT_MODEL        = "openai/whisper-base"
+CHUNK_LENGTH_S       = 30          # seconds per chunk fed to Whisper
+BATCH_SIZE           = 8           # parallel chunks (reduce if OOM on GPU)
+STRIDE_LENGTH_S      = 5           # overlap between chunks for better continuity
+MAX_WORDS_PER_BLOCK  = 16          # max words per SRT subtitle block
 
 # ---------------------------------------------------------------------------
 # Core functions
@@ -204,9 +205,110 @@ def _seconds_to_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def _split_long_segments(
+    segments: List[dict],
+    max_words: int = MAX_WORDS_PER_BLOCK,
+) -> List[dict]:
+    """
+    Split segments whose text exceeds *max_words* into smaller sub-segments.
+
+    Timestamps are distributed proportionally based on word count so that
+    each resulting block covers a fair share of the original time span.
+
+    Args:
+        segments:  Original segment list from Whisper.
+        max_words: Maximum number of words allowed per subtitle block.
+
+    Returns:
+        A new list of segments, each containing at most *max_words* words.
+    """
+    result: List[dict] = []
+
+    for seg in segments:
+        timestamp = seg.get("timestamp", (0.0, 0.0))
+        text = seg.get("text", "").strip()
+        words = text.split()
+
+        if len(words) <= max_words:
+            result.append(seg)
+            continue
+
+        # --- Proportional time splitting ---
+        start_s = timestamp[0] if timestamp[0] is not None else 0.0
+        end_s   = timestamp[1] if timestamp[1] is not None else start_s + 2.0
+        if end_s <= start_s:
+            end_s = start_s + 0.5
+
+        total_words = len(words)
+        duration    = end_s - start_s
+
+        for chunk_start_idx in range(0, total_words, max_words):
+            chunk_words = words[chunk_start_idx : chunk_start_idx + max_words]
+            chunk_end_idx = min(chunk_start_idx + len(chunk_words), total_words)
+
+            # Proportional timestamps
+            sub_start = start_s + duration * (chunk_start_idx / total_words)
+            sub_end   = start_s + duration * (chunk_end_idx   / total_words)
+
+            result.append({
+                "timestamp": (sub_start, sub_end),
+                "text": " ".join(chunk_words),
+            })
+
+    return result
+
+
+def _wrap_text(text: str, max_chars_per_line: int = 42) -> str:
+    """
+    Wrap subtitle text into at most 2 lines for comfortable on-screen reading.
+
+    Standard subtitle best-practice is ≤42 characters per line and a maximum
+    of 2 lines per block.  This function splits roughly in the middle at a
+    word boundary when the text exceeds *max_chars_per_line*.
+
+    Args:
+        text:               The subtitle text (single paragraph).
+        max_chars_per_line:  Soft character limit that triggers wrapping.
+
+    Returns:
+        The text, potentially with a single newline inserted.
+    """
+    if len(text) <= max_chars_per_line:
+        return text
+
+    words = text.split()
+    if len(words) <= 1:
+        return text
+
+    # Find the split point closest to the middle
+    mid = len(text) // 2
+    best_pos = None
+    best_dist = len(text)
+
+    pos = 0
+    for i, word in enumerate(words[:-1]):
+        pos += len(word)
+        dist = abs(pos + i - mid)       # +i accounts for spaces
+        if dist < best_dist:
+            best_dist = dist
+            best_pos  = i
+        pos += 0  # space counted via index offset
+
+    if best_pos is not None:
+        line1 = " ".join(words[: best_pos + 1])
+        line2 = " ".join(words[best_pos + 1 :])
+        return f"{line1}\n{line2}"
+
+    return text
+
+
 def segments_to_srt(segments: List[dict]) -> str:
     """
     Convert a list of Whisper segments into a valid SRT-formatted string.
+
+    Long segments are automatically split so that each subtitle block
+    contains at most MAX_WORDS_PER_BLOCK words, and text is wrapped into
+    two lines for comfortable reading.
 
     Args:
         segments: List of dicts with 'timestamp' (tuple) and 'text' (str).
@@ -218,11 +320,15 @@ def segments_to_srt(segments: List[dict]) -> str:
     Example output block:
         1
         00:00:00,000 --> 00:00:04,320
-        Hello and welcome to the podcast.
+        Hello and welcome
+        to the podcast.
 
     """
     if not segments:
         return ""
+
+    # Split segments that exceed the word limit
+    segments = _split_long_segments(segments)
 
     srt_blocks: List[str] = []
 
@@ -241,7 +347,10 @@ def segments_to_srt(segments: List[dict]) -> str:
         start_ts = _seconds_to_srt_timestamp(start_s)
         end_ts   = _seconds_to_srt_timestamp(end_s)
 
-        block = f"{index}\n{start_ts} --> {end_ts}\n{text}"
+        # Wrap text into 2 lines for readability
+        wrapped_text = _wrap_text(text)
+
+        block = f"{index}\n{start_ts} --> {end_ts}\n{wrapped_text}"
         srt_blocks.append(block)
 
     # SRT blocks are separated by a blank line

@@ -1,0 +1,399 @@
+"""
+audio_to_srt.py — Automatic Speech Recognition → SRT Subtitle Generator
+=========================================================================
+Converts audio files (MP3, WAV, M4A, FLAC) to timestamped .srt subtitle
+files using OpenAI Whisper via the HuggingFace Transformers pipeline.
+
+Dependencies (install before running):
+    pip install transformers torch torchaudio accelerate tqdm
+    pip install ffmpeg-python librosa soundfile
+
+    # Also requires ffmpeg binary on your system PATH:
+    #   Ubuntu/Debian : sudo apt install ffmpeg
+    #   macOS         : brew install ffmpeg
+    #   Windows       : https://ffmpeg.org/download.html
+
+Supported models (--model flag):
+    openai/whisper-tiny        ~39M  params  fastest, lowest accuracy
+    openai/whisper-base        ~74M  params  good balance (default)
+    openai/whisper-small       ~244M params
+    openai/whisper-medium      ~769M params
+    openai/whisper-large-v3    ~1.5B params  highest accuracy, slowest
+
+Usage examples:
+    # Basic — uses whisper-base, auto-detects GPU
+    python audio_to_srt.py podcast.mp3
+
+    # Choose model size
+    python audio_to_srt.py lecture.wav --model openai/whisper-large-v3
+
+    # Specify output path and language
+    python audio_to_srt.py interview.flac --output interview.srt --language id
+
+    # Force CPU even if GPU is available
+    python audio_to_srt.py clip.m4a --device cpu
+
+    # Batch: multiple files at once
+    python audio_to_srt.py ep1.mp3 ep2.mp3 ep3.mp3 --model openai/whisper-small
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional
+
+import torch
+from tqdm import tqdm
+from transformers import pipeline, Pipeline
+
+# ---------------------------------------------------------------------------
+# Dependency checks — fail early with a helpful message
+# ---------------------------------------------------------------------------
+
+def _require(package: str, install_hint: str) -> None:
+    """Import-check a package and print an actionable error if missing."""
+    import importlib
+    if importlib.util.find_spec(package) is None:
+        print(f"[ERROR] Missing package '{package}'. Install with:\n  {install_hint}")
+        sys.exit(1)
+
+
+_require("transformers", "pip install transformers")
+_require("torch",        "pip install torch torchaudio")
+_require("tqdm",         "pip install tqdm")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".webm"}
+
+DEFAULT_MODEL   = "openai/whisper-base"
+CHUNK_LENGTH_S  = 30          # seconds per chunk fed to Whisper
+BATCH_SIZE      = 8           # parallel chunks (reduce if OOM on GPU)
+STRIDE_LENGTH_S = 5           # overlap between chunks for better continuity
+
+# ---------------------------------------------------------------------------
+# Core functions
+# ---------------------------------------------------------------------------
+
+def detect_device() -> str:
+    """Return 'cuda', 'mps', or 'cpu' based on hardware availability."""
+    if torch.cuda.is_available():
+        return "cuda"
+    # Apple Silicon MPS support (PyTorch ≥ 2.0)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_pipeline(model_name: str, device: str) -> Pipeline:
+    """
+    Load the Whisper ASR pipeline from HuggingFace.
+
+    Args:
+        model_name: HuggingFace model identifier, e.g. 'openai/whisper-base'
+        device:     'cuda', 'mps', or 'cpu'
+
+    Returns:
+        A HuggingFace transformers ASR Pipeline object.
+
+    Raises:
+        SystemExit: if the model cannot be loaded.
+    """
+    print(f"[INFO] Loading model '{model_name}' on device '{device}' …")
+    try:
+        torch_dtype = torch.float16 if device == "cuda" else torch.float32
+
+        asr = pipeline(
+            task="automatic-speech-recognition",
+            model=model_name,
+            torch_dtype=torch_dtype,
+            device=device,
+            model_kwargs={"use_safetensors": True},
+        )
+        print("[INFO] Model loaded successfully.")
+        return asr
+
+    except OSError as exc:
+        print(f"[ERROR] Could not load model '{model_name}':\n  {exc}")
+        print("  Check your internet connection or try a smaller model with --model.")
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] Unexpected error while loading model:\n  {exc}")
+        sys.exit(1)
+
+
+def transcribe_audio(
+    file_path: str | Path,
+    asr_pipeline: Pipeline,
+    language: Optional[str] = None,
+) -> List[dict]:
+    """
+    Transcribe an audio file and return a list of timed segments.
+
+    Args:
+        file_path:    Path to the audio file.
+        asr_pipeline: Pre-loaded HuggingFace ASR pipeline.
+        language:     ISO-639-1 language code hint, e.g. 'en', 'id', 'fr'.
+                      None = auto-detect.
+
+    Returns:
+        List of segment dicts: [{"timestamp": (start, end), "text": "…"}, …]
+
+    Raises:
+        FileNotFoundError: if the audio file does not exist.
+        ValueError:        if the file extension is unsupported.
+    """
+    file_path = Path(file_path)
+
+    # --- Validation ---
+    if not file_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {file_path}")
+
+    if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type '{file_path.suffix}'. "
+            f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+
+    print(f"[INFO] Transcribing '{file_path.name}' …")
+    start_time = time.time()
+
+    # --- Build generation kwargs ---
+    generate_kwargs: dict = {"task": "transcribe"}
+    if language:
+        generate_kwargs["language"] = language
+
+    # --- Run pipeline ---
+    result = asr_pipeline(
+        str(file_path),
+        chunk_length_s=CHUNK_LENGTH_S,
+        batch_size=BATCH_SIZE,
+        stride_length_s=STRIDE_LENGTH_S,
+        return_timestamps=True,        # required for SRT timing
+        generate_kwargs=generate_kwargs,
+    )
+
+    elapsed = time.time() - start_time
+    chunks: list = result.get("chunks", [])
+    print(f"[INFO] Transcription done in {elapsed:.1f}s — {len(chunks)} segments found.")
+
+    return chunks
+
+
+def _seconds_to_srt_timestamp(seconds: float) -> str:
+    """
+    Convert a float seconds value to SRT timestamp format.
+
+    Example:
+        3723.456  →  '01:02:03,456'
+    """
+    if seconds is None or seconds < 0:
+        seconds = 0.0
+    hours   = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs    = int(seconds % 60)
+    millis  = int(round((seconds - int(seconds)) * 1000))
+    # Guard against millisecond rounding to 1000
+    if millis >= 1000:
+        millis = 999
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def segments_to_srt(segments: List[dict]) -> str:
+    """
+    Convert a list of Whisper segments into a valid SRT-formatted string.
+
+    Args:
+        segments: List of dicts with 'timestamp' (tuple) and 'text' (str).
+                  timestamp = (start_seconds, end_seconds)
+
+    Returns:
+        A string in SRT format ready to be saved as a .srt file.
+
+    Example output block:
+        1
+        00:00:00,000 --> 00:00:04,320
+        Hello and welcome to the podcast.
+
+    """
+    if not segments:
+        return ""
+
+    srt_blocks: List[str] = []
+
+    for index, segment in enumerate(segments, start=1):
+        timestamp = segment.get("timestamp", (0.0, 0.0))
+        text      = segment.get("text", "").strip()
+
+        # Whisper occasionally returns None for end timestamp on the last chunk
+        start_s: float = timestamp[0] if timestamp[0] is not None else 0.0
+        end_s:   float = timestamp[1] if timestamp[1] is not None else start_s + 2.0
+
+        # Ensure start < end (safety clamp)
+        if end_s <= start_s:
+            end_s = start_s + 0.5
+
+        start_ts = _seconds_to_srt_timestamp(start_s)
+        end_ts   = _seconds_to_srt_timestamp(end_s)
+
+        block = f"{index}\n{start_ts} --> {end_ts}\n{text}"
+        srt_blocks.append(block)
+
+    # SRT blocks are separated by a blank line
+    return "\n\n".join(srt_blocks) + "\n"
+
+
+def save_srt(srt_content: str, output_path: str | Path) -> Path:
+    """
+    Write SRT content to a file.
+
+    Args:
+        srt_content: The formatted SRT string.
+        output_path: Destination file path (will be created/overwritten).
+
+    Returns:
+        Resolved Path of the saved file.
+
+    Raises:
+        IOError: if the file cannot be written.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        output_path.write_text(srt_content, encoding="utf-8")
+        print(f"[INFO] SRT saved → {output_path.resolve()}")
+        return output_path.resolve()
+    except IOError as exc:
+        print(f"[ERROR] Could not write SRT file:\n  {exc}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def build_output_path(audio_path: Path, output_arg: Optional[str]) -> Path:
+    """Derive the .srt output path from the audio filename if not specified."""
+    if output_arg:
+        p = Path(output_arg)
+        if p.suffix.lower() != ".srt":
+            p = p.with_suffix(".srt")
+        return p
+    return audio_path.with_suffix(".srt")
+
+
+def process_file(
+    audio_path: Path,
+    asr_pipeline: Pipeline,
+    output_arg: Optional[str],
+    language: Optional[str],
+) -> None:
+    """Transcribe a single file and save its .srt output."""
+    try:
+        segments    = transcribe_audio(audio_path, asr_pipeline, language)
+        srt_content = segments_to_srt(segments)
+
+        if not srt_content.strip():
+            print(f"[WARN] No speech detected in '{audio_path.name}'. SRT not saved.")
+            return
+
+        out_path = build_output_path(audio_path, output_arg)
+        save_srt(srt_content, out_path)
+
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] Failed to process '{audio_path.name}':\n  {exc}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="audio_to_srt",
+        description="Convert audio files to SRT subtitles using HuggingFace Whisper.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    parser.add_argument(
+        "audio_files",
+        nargs="+",
+        metavar="AUDIO_FILE",
+        help="Path(s) to audio file(s). Supported: mp3 wav m4a flac ogg opus webm",
+    )
+    parser.add_argument(
+        "--model", "-m",
+        default=DEFAULT_MODEL,
+        metavar="MODEL_ID",
+        help=(
+            f"HuggingFace Whisper model ID (default: {DEFAULT_MODEL}).\n"
+            "Options: whisper-tiny, whisper-base, whisper-small, "
+            "whisper-medium, whisper-large-v3"
+        ),
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        metavar="OUTPUT.srt",
+        help=(
+            "Output .srt file path. Only valid when a single input file is given. "
+            "For multiple files, .srt is saved alongside each audio file."
+        ),
+    )
+    parser.add_argument(
+        "--language", "-l",
+        default=None,
+        metavar="LANG",
+        help=(
+            "ISO-639-1 language code to force (e.g. 'en', 'id', 'fr', 'ja'). "
+            "Omit for auto-detection."
+        ),
+    )
+    parser.add_argument(
+        "--device", "-d",
+        default=None,
+        choices=["cpu", "cuda", "mps"],
+        help="Compute device. Defaults to auto-detect (cuda > mps > cpu).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="audio_to_srt 1.0.0",
+    )
+
+    args = parser.parse_args()
+
+    # --- Resolve device ---
+    device = args.device or detect_device()
+    print(f"[INFO] Using device: {device}")
+
+    # --- Guard: --output only makes sense with one input file ---
+    if args.output and len(args.audio_files) > 1:
+        print("[WARN] --output is ignored when multiple input files are given.")
+        args.output = None
+
+    # --- Load model once, reuse across all files ---
+    asr_pipeline = load_pipeline(args.model, device)
+
+    # --- Process files ---
+    audio_paths = [Path(f) for f in args.audio_files]
+
+    if len(audio_paths) == 1:
+        process_file(audio_paths[0], asr_pipeline, args.output, args.language)
+    else:
+        print(f"[INFO] Batch mode: processing {len(audio_paths)} files …")
+        for audio_path in tqdm(audio_paths, desc="Files", unit="file"):
+            process_file(audio_path, asr_pipeline, None, args.language)
+
+    print("[INFO] All done.")
+
+
+if __name__ == "__main__":
+    main()
